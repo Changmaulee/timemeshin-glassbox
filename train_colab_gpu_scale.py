@@ -275,7 +275,7 @@ def train_gpu_scaled():
         if step % 20 == 0 or step == start_step + 1:
             elapsed = time.time() - start_time
             tok_per_sec = accum_tokens / max(1e-5, elapsed)
-            print(f"  [Step {step:05d}/{CONFIG['max_steps']}] | Loss: {loss_accum*CONFIG['grad_accum_steps']:.4f} | CE: {ce_loss.item():.4f} | LR: {lr:.2e} | Speed: {tok_per_sec:.1f} tok/s")
+            print(f"  [Step {step:05d}/{CONFIG['max_steps']}] | Loss: {loss_accum*CONFIG['grad_accum_steps']:.4f} | CE: {ce_loss.item():.4f} | LR: {lr:.2e} | Speed: {tok_per_sec:.1f} tok/s", flush=True)
 
         # Save Checkpoint Directly to Drive / Local
         if step % CONFIG["save_interval"] == 0 or step == CONFIG["max_steps"]:
@@ -287,7 +287,7 @@ def train_gpu_scaled():
                 "scaler_state": scaler.state_dict(),
                 "config": CONFIG
             }, save_path)
-            print(f"  [💾 CHECKPOINT SAVED] => {save_path}")
+            print(f"  [💾 CHECKPOINT SAVED] => {save_path}", flush=True)
 
     print(f"\n[+] Pre-training completed in {(time.time()-start_time)/60:.2f} minutes!")
 
