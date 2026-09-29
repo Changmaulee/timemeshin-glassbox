@@ -1,11 +1,11 @@
 # ==============================================================================
-# TIMEMESHIN-GLASSBOX: SCALED GPU PRE-TRAINING ENGINE (GOOGLE COLAB / RUNPOD)
-# Architecture: 6-Layer State-Space LM + Hierarchical RVQ + TMOT Indic Tokenizer
-# Hardware: Optimized for CUDA (T4, V100, A100, H100, RTX 3090/4090)
+# TIMEMESHIN-GLASSBOX: RESILIENT GPU PRE-TRAINING ENGINE (GOOGLE COLAB / RUNPOD)
+# Features: Auto-Resume, Google Drive Checkpoint Persistence, Mixed Precision (AMP)
 # ==============================================================================
 
 import os
 import sys
+import glob
 import time
 import math
 import torch
@@ -15,7 +15,12 @@ from torch.cuda.amp import autocast, GradScaler
 from transformers import AutoTokenizer
 from datasets import load_dataset
 
-# 1. Hyperparameter Configurations
+# Determine Best Persistent Checkpoint Directory (Google Drive or Local)
+DRIVE_DIR = "/content/drive/MyDrive/timemeshin_checkpoints"
+LOCAL_DIR = "./checkpoints"
+CHECKPOINT_DIR = DRIVE_DIR if os.path.exists("/content/drive/MyDrive") else LOCAL_DIR
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
 CONFIG = {
     "model_name": "TimeMeshin-Indic-125M",
     "tokenizer_id": "changmaulee/timemeshin-indic-otm-tokenizer",
@@ -27,12 +32,12 @@ CONFIG = {
     "grad_accum_steps": 4,       # Effective batch size = 16 * 4 = 64
     "learning_rate": 4e-4,       # Peak learning rate
     "warmup_steps": 500,
-    "max_steps": 5000,           # Total pre-training steps
-    "save_interval": 500,
+    "max_steps": 10000,          # Total pre-training steps
+    "save_interval": 250,        # Save checkpoint every 250 steps
+    "checkpoint_dir": CHECKPOINT_DIR,
     "mixed_precision": True      # FP16 / BF16 AMP for 2.5x speedup
 }
 
-# 2. TimeMeshin Glassbox Scaled Architecture
 class ScaledTimeMeshinGlassboxLM(nn.Module):
     def __init__(self, vocab_size, dim=512, num_rvq_layers=4, choices_per_layer=1024):
         super().__init__()
@@ -61,9 +66,9 @@ class ScaledTimeMeshinGlassboxLM(nn.Module):
         )
         self.norm = nn.LayerNorm(dim)
 
-        # Layer 6: Output Language Modeling Head
+        # Layer 6: Output Language Modeling Head (Tied Weights)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
-        self.lm_head.weight = self.tok_embeddings.weight  # Weight tying for efficiency
+        self.lm_head.weight = self.tok_embeddings.weight
 
     def forward(self, input_ids):
         batch_size, seq_len = input_ids.shape
@@ -79,7 +84,6 @@ class ScaledTimeMeshinGlassboxLM(nn.Module):
         rvq_commitment_loss = 0.0
 
         for cb in self.codebooks:
-            # Parallel distance computation
             dists = torch.cdist(residual.unsqueeze(1), cb.weight.unsqueeze(0)).squeeze(1)
             indices = torch.argmin(dists, dim=-1)
             q_layer = cb(indices)
@@ -88,7 +92,6 @@ class ScaledTimeMeshinGlassboxLM(nn.Module):
             q_ste = residual + (q_layer - residual).detach()
             quantized_total = quantized_total + q_ste
 
-            # Commitment loss
             rvq_commitment_loss += torch.mean((residual - q_layer.detach()) ** 2)
             residual = residual - q_layer
 
@@ -99,7 +102,6 @@ class ScaledTimeMeshinGlassboxLM(nn.Module):
         running_h = torch.zeros(batch_size, self.dim, device=device)
 
         for t in range(seq_len):
-            # Dynamic I-frame (every 4th token / root) vs B-frame (delta) decay
             tau = self.tau_macro if t % 4 == 0 else self.tau_delta
             h_next = tau * running_h + (1.0 - tau) * self.transition_matrix(quant_seq[:, t, :])
             running_h = h_next
@@ -115,17 +117,23 @@ class ScaledTimeMeshinGlassboxLM(nn.Module):
         logits = self.lm_head(features)
         return logits, rvq_commitment_loss / self.num_rvq_layers
 
-# 3. Learning Rate Scheduler with Warmup & Cosine Decay
 def get_lr(step, warmup_steps, max_steps, max_lr, min_lr=1e-5):
     if step < warmup_steps:
         return max_lr * (step + 1) / warmup_steps
     progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
     return min_lr + 0.5 * (max_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
 
-# 4. Master Training Engine
+def find_latest_checkpoint(ckpt_dir):
+    checkpoints = glob.glob(os.path.join(ckpt_dir, "timemeshin_step_*.pt"))
+    if not checkpoints:
+        return None
+    # Sort by step index
+    checkpoints.sort(key=lambda x: int(x.split("_step_")[-1].replace(".pt", "")))
+    return checkpoints[-1]
+
 def train_gpu_scaled():
     print("=========================================================================================")
-    print("       TIMEMESHIN-GLASSBOX: HIGH-THROUGHPUT GPU PRE-TRAINING INITIALIZATION              ")
+    print("    TIMEMESHIN-GLASSBOX: RESILIENT GPU PRE-TRAINING ENGINE (WITH AUTO-RESUME)            ")
     print("=========================================================================================")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -134,7 +142,9 @@ def train_gpu_scaled():
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"[+] Active GPU: {gpu_name} ({vram_gb:.2f} GB VRAM)")
     else:
-        print("[!] CUDA not detected; running in CPU demonstration mode.")
+        print("[!] CUDA not detected; running in CPU mode.")
+
+    print(f"[+] Checkpoint Storage Path: {CONFIG['checkpoint_dir']}")
 
     # Load Tokenizer
     print(f"[*] Loading Tokenizer: {CONFIG['tokenizer_id']}...")
@@ -142,7 +152,7 @@ def train_gpu_scaled():
     vocab_size = len(tokenizer)
     print(f"[+] Tokenizer Vocab Size: {vocab_size:,} tokens")
 
-    # Initialize Model
+    # Initialize Model & Optimizer
     model = ScaledTimeMeshinGlassboxLM(
         vocab_size=vocab_size,
         dim=CONFIG["dim"],
@@ -150,15 +160,28 @@ def train_gpu_scaled():
         choices_per_layer=CONFIG["choices_per_layer"]
     ).to(device)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"[+] Model Architecture Initialized! Total Trainable Parameters: {total_params:,} (~{total_params/1e6:.1f}M)")
-
-    # Optimizer & Mixed Precision Scaler
     optimizer = optim.AdamW(model.parameters(), lr=CONFIG["learning_rate"], weight_decay=0.01, betas=(0.9, 0.95))
     scaler = GradScaler(enabled=CONFIG["mixed_precision"] and device.type == "cuda")
 
+    # 1. Check for Existing Checkpoint to Resume
+    start_step = 0
+    latest_ckpt = find_latest_checkpoint(CONFIG["checkpoint_dir"])
+
+    if latest_ckpt:
+        print(f"\n[🔄 RESUME DETECTED] Found existing checkpoint: {latest_ckpt}")
+        ckpt_data = torch.load(latest_ckpt, map_location=device)
+        model.load_state_dict(ckpt_data["model_state"])
+        optimizer.load_state_dict(ckpt_data["optimizer_state"])
+        if "scaler_state" in ckpt_data and device.type == "cuda":
+            scaler.load_state_dict(ckpt_data["scaler_state"])
+        start_step = ckpt_data.get("step", 0)
+        print(f"[+] Successfully resumed from Step {start_step:,} / {CONFIG['max_steps']:,}!\n")
+    else:
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"[+] Fresh Training Initialization: {total_params:,} parameters (~{total_params/1e6:.1f}M)\n")
+
     # Connect to Streaming Multilingual Data
-    print("[*] Connecting to Streaming Multilingual Corpus (AI4Bharat / Wikipedia stream)...")
+    print("[*] Connecting to Streaming Multilingual Corpus...")
     try:
         dataset = load_dataset("wikimedia/wikipedia", "20231101.hi", split="train", streaming=True)
         data_iter = iter(dataset)
@@ -173,12 +196,11 @@ def train_gpu_scaled():
         "கற்க கசடறக் கற்றவை கற்றபின் நிற்க அதற்குத் தக. யாதும் ஊரே யாவரும் கேளிர்.",
         "దేశభాషలందు తెలుగు లెస్స అని శ్రీకృష్ణదేవరాయలు కీర్తించిరి.",
         "ಸಿರಿಗನ್ನಡಂ ಗೆಲ್ಗೆ ಸಿರಿಗನ್ನಡಂ ಬಾಳ್ಗೆ ಎಂದು ಕನ್ನಡದ ಕವಿಗಳು ಹಾಡಿದ್ದಾರೆ.",
-        "মোদের গরব মোদের আশা আমরি বাংলা ভাষা । চিত্ত যেথা ভয়শূন্য উচ্চ যেথা শির ।"
+        "মোদের গরব মোদের আশা আমরি বাংলা ভাষা । চিত্ত যেথা ভয়শূন্য उच्च যেথা শির ।"
     ]
 
-    print(f"\n[*] Commencing Pre-Training Sweep ({CONFIG['max_steps']} steps, seq_len={CONFIG['seq_len']})...\n")
     model.train()
-    step = 0
+    step = start_step
     accum_tokens = 0
     start_time = time.time()
 
@@ -192,7 +214,6 @@ def train_gpu_scaled():
         loss_accum = 0.0
 
         for _ in range(CONFIG["grad_accum_steps"]):
-            # Build Batch
             batch_texts = []
             for _ in range(CONFIG["batch_size"]):
                 if data_iter:
@@ -216,10 +237,8 @@ def train_gpu_scaled():
             input_ids = enc["input_ids"].to(device)
             targets = input_ids.clone()
 
-            # Autocast mixed precision forward pass
             with autocast(enabled=CONFIG["mixed_precision"] and device.type == "cuda"):
                 logits, rvq_loss = model(input_ids)
-                # Next-token Cross Entropy Loss
                 shift_logits = logits[:, :-1, :].contiguous()
                 shift_targets = targets[:, 1:].contiguous()
 
@@ -239,24 +258,25 @@ def train_gpu_scaled():
         scaler.step(optimizer)
         scaler.update()
 
-        # Telemetry Logging
-        if step % 20 == 0 or step == 1:
+        # Telemetry
+        if step % 20 == 0 or step == start_step + 1:
             elapsed = time.time() - start_time
             tok_per_sec = accum_tokens / max(1e-5, elapsed)
-            print(f"  [Step {step:04d}/{CONFIG['max_steps']}] | Loss: {loss_accum*CONFIG['grad_accum_steps']:.4f} | CE: {ce_loss.item():.4f} | LR: {lr:.2e} | Speed: {tok_per_sec:.1f} tok/s")
+            print(f"  [Step {step:05d}/{CONFIG['max_steps']}] | Loss: {loss_accum*CONFIG['grad_accum_steps']:.4f} | CE: {ce_loss.item():.4f} | LR: {lr:.2e} | Speed: {tok_per_sec:.1f} tok/s")
 
-        # Save Checkpoint
+        # Save Checkpoint Directly to Drive / Local
         if step % CONFIG["save_interval"] == 0 or step == CONFIG["max_steps"]:
-            save_path = f"timemeshin_scaled_step_{step}.pt"
+            save_path = os.path.join(CONFIG["checkpoint_dir"], f"timemeshin_step_{step}.pt")
             torch.save({
                 "step": step,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
+                "scaler_state": scaler.state_dict(),
                 "config": CONFIG
             }, save_path)
-            print(f"  [+] Checkpoint saved: {save_path}")
+            print(f"  [💾 CHECKPOINT SAVED] => {save_path}")
 
-    print(f"\n[+] Pre-training complete in {(time.time()-start_time)/60:.2f} minutes!")
+    print(f"\n[+] Pre-training completed in {(time.time()-start_time)/60:.2f} minutes!")
 
 if __name__ == "__main__":
     train_gpu_scaled()
