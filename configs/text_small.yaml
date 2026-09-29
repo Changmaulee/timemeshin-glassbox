@@ -1,0 +1,17 @@
+model_meta:
+  name: "timemeshin-glassbox-small"
+  dimension: 256
+  vocab_size: 12000
+
+architecture_layers:
+  num_codebooks: 3
+  entries_per_codebook: 256
+  timescale_clocks:
+    tau_macro_iframe: 0.95
+    tau_delta_bframe: 0.40
+
+training_hyperparameters:
+  batch_size: 32
+  learning_rate: 0.0003
+  beta_commitment: 0.25
+  beta_dictionary: 1.0
