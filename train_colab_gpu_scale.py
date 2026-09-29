@@ -14,6 +14,8 @@ import torch.optim as optim
 from transformers import AutoTokenizer
 from datasets import load_dataset
 
+import argparse
+
 # Determine Best Persistent Checkpoint Directory (Google Drive or Local)
 DRIVE_DIR = "/content/drive/MyDrive/timemeshin_checkpoints"
 LOCAL_DIR = "./checkpoints"
@@ -31,8 +33,8 @@ CONFIG = {
     "grad_accum_steps": 8,       # Effective batch size = 8 * 8 = 64
     "learning_rate": 3e-4,       # Peak learning rate
     "warmup_steps": 500,
-    "max_steps": 10000,          # Total pre-training steps
-    "save_interval": 250,        # Save checkpoint every 250 steps
+    "max_steps": 50000,          # Default 50,000 steps for deep fluency
+    "save_interval": 500,        # Save checkpoint every 500 steps
     "checkpoint_dir": CHECKPOINT_DIR,
     "mixed_precision": True      # FP16 / BF16 AMP for 2.5x speedup
 }
@@ -290,4 +292,12 @@ def train_gpu_scaled():
     print(f"\n[+] Pre-training completed in {(time.time()-start_time)/60:.2f} minutes!")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="TimeMeshin Scaled GPU Training Engine")
+    parser.add_argument("--max_steps", type=int, default=50000, help="Total pre-training steps")
+    parser.add_argument("--save_interval", type=int, default=500, help="Checkpoint interval")
+    args = parser.parse_args()
+
+    CONFIG["max_steps"] = args.max_steps
+    CONFIG["save_interval"] = args.save_interval
+
     train_gpu_scaled()
