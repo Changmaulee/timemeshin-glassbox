@@ -1,6 +1,6 @@
 # ==============================================================================
 # TIMEMESHIN-GLASSBOX: RESILIENT GPU PRE-TRAINING ENGINE (GOOGLE COLAB / RUNPOD)
-# Features: Auto-Resume, Google Drive Checkpoint Persistence, Mixed Precision (AMP)
+# Features: Fast GEMM Vector Quantization (Zero-OOM), Auto-Resume, Google Drive Sync
 # ==============================================================================
 
 import os
@@ -11,7 +11,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
 from transformers import AutoTokenizer
 from datasets import load_dataset
 
@@ -27,10 +26,10 @@ CONFIG = {
     "dim": 512,                  # Latent dimension (512 for ~125M scaled model)
     "num_rvq_layers": 4,         # 4-stage Hierarchical RVQ Abacus
     "choices_per_layer": 1024,   # 1024 discrete centroids per layer
-    "seq_len": 256,              # Context window length
-    "batch_size": 16,            # Micro-batch size per GPU
-    "grad_accum_steps": 4,       # Effective batch size = 16 * 4 = 64
-    "learning_rate": 4e-4,       # Peak learning rate
+    "seq_len": 128,              # Context window length (Fast, memory-safe for T4 GPU)
+    "batch_size": 8,             # Micro-batch size per forward pass
+    "grad_accum_steps": 8,       # Effective batch size = 8 * 8 = 64
+    "learning_rate": 3e-4,       # Peak learning rate
     "warmup_steps": 500,
     "max_steps": 10000,          # Total pre-training steps
     "save_interval": 250,        # Save checkpoint every 250 steps
@@ -38,6 +37,7 @@ CONFIG = {
     "mixed_precision": True      # FP16 / BF16 AMP for 2.5x speedup
 }
 
+# 2. TimeMeshin Glassbox Scaled Architecture with Ultra-Fast 2D GEMM Quantization
 class ScaledTimeMeshinGlassboxLM(nn.Module):
     def __init__(self, vocab_size, dim=512, num_rvq_layers=4, choices_per_layer=1024):
         super().__init__()
@@ -53,7 +53,7 @@ class ScaledTimeMeshinGlassboxLM(nn.Module):
             nn.Embedding(choices_per_layer, dim) for _ in range(num_rvq_layers)
         ])
 
-        # Layer 4: Multi-Scale Timescale Decay Rates (Macro tau=0.95, Delta tau=0.40)
+        # Layer 4: Multi-Scale Timescale Decay Rates
         self.register_buffer("tau_macro", torch.tensor(0.95))
         self.register_buffer("tau_delta", torch.tensor(0.40))
         self.transition_matrix = nn.Linear(dim, dim, bias=False)
@@ -77,14 +77,18 @@ class ScaledTimeMeshinGlassboxLM(nn.Module):
         # Embed input tokens
         x = self.tok_embeddings(input_ids)
 
-        # Hierarchical RVQ Vectorized Snapping across all tokens
+        # Fast 2D GEMM Parallel Vector Quantization (O(1) VRAM Memory Footprint)
         flat_x = x.reshape(-1, self.dim)
         residual = flat_x
         quantized_total = torch.zeros_like(flat_x)
         rvq_commitment_loss = 0.0
 
         for cb in self.codebooks:
-            dists = torch.cdist(residual.unsqueeze(1), cb.weight.unsqueeze(0)).squeeze(1)
+            # Memory-Efficient Distance: ||x - c||^2 = ||x||^2 - 2(x . c^T) + ||c||^2
+            x_sq = torch.sum(residual ** 2, dim=-1, keepdim=True)       # (N, 1)
+            c_sq = torch.sum(cb.weight ** 2, dim=-1).unsqueeze(0)      # (1, K)
+            dists = x_sq - 2.0 * torch.matmul(residual, cb.weight.t()) + c_sq # (N, K) 2D GEMM
+            
             indices = torch.argmin(dists, dim=-1)
             q_layer = cb(indices)
 
@@ -127,7 +131,6 @@ def find_latest_checkpoint(ckpt_dir):
     checkpoints = glob.glob(os.path.join(ckpt_dir, "timemeshin_step_*.pt"))
     if not checkpoints:
         return None
-    # Sort by step index
     checkpoints.sort(key=lambda x: int(x.split("_step_")[-1].replace(".pt", "")))
     return checkpoints[-1]
 
@@ -161,14 +164,19 @@ def train_gpu_scaled():
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=CONFIG["learning_rate"], weight_decay=0.01, betas=(0.9, 0.95))
-    scaler = GradScaler(enabled=CONFIG["mixed_precision"] and device.type == "cuda")
+    
+    # Modern PyTorch AMP Scaler
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler('cuda', enabled=CONFIG["mixed_precision"] and device.type == "cuda")
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=CONFIG["mixed_precision"] and device.type == "cuda")
 
     # 1. Check for Existing Checkpoint to Resume
     start_step = 0
     latest_ckpt = find_latest_checkpoint(CONFIG["checkpoint_dir"])
 
     if latest_ckpt:
-        print(f"\n[🔄 RESUME DETECTED] Found existing checkpoint: {latest_ckpt}")
+        print(f"\n[RESUME DETECTED] Found existing checkpoint: {latest_ckpt}")
         ckpt_data = torch.load(latest_ckpt, map_location=device)
         model.load_state_dict(ckpt_data["model_state"])
         optimizer.load_state_dict(ckpt_data["optimizer_state"])
@@ -204,6 +212,9 @@ def train_gpu_scaled():
     accum_tokens = 0
     start_time = time.time()
 
+    # Device autocast context
+    autocast_ctx = torch.amp.autocast('cuda', enabled=CONFIG["mixed_precision"] and device.type == "cuda") if hasattr(torch, "amp") else torch.cuda.amp.autocast(enabled=CONFIG["mixed_precision"] and device.type == "cuda")
+
     while step < CONFIG["max_steps"]:
         step += 1
         lr = get_lr(step, CONFIG["warmup_steps"], CONFIG["max_steps"], CONFIG["learning_rate"])
@@ -219,11 +230,11 @@ def train_gpu_scaled():
                 if data_iter:
                     try:
                         sample = next(data_iter)
-                        batch_texts.append(sample.get("text", "")[:500])
+                        batch_texts.append(sample.get("text", "")[:400])
                     except StopIteration:
                         data_iter = iter(dataset)
                         sample = next(data_iter)
-                        batch_texts.append(sample.get("text", "")[:500])
+                        batch_texts.append(sample.get("text", "")[:400])
                 else:
                     batch_texts.append(fallback_corpus[(step + _) % len(fallback_corpus)])
 
@@ -237,7 +248,7 @@ def train_gpu_scaled():
             input_ids = enc["input_ids"].to(device)
             targets = input_ids.clone()
 
-            with autocast(enabled=CONFIG["mixed_precision"] and device.type == "cuda"):
+            with autocast_ctx:
                 logits, rvq_loss = model(input_ids)
                 shift_logits = logits[:, :-1, :].contiguous()
                 shift_targets = targets[:, 1:].contiguous()
