@@ -17,10 +17,21 @@ from datasets import load_dataset
 import argparse
 
 # Determine Best Persistent Checkpoint Directory (Google Drive or Local)
-DRIVE_DIR = "/content/drive/MyDrive/timemeshin_checkpoints"
-LOCAL_DIR = "./checkpoints"
-CHECKPOINT_DIR = DRIVE_DIR if os.path.exists("/content/drive/MyDrive") else LOCAL_DIR
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+def resolve_checkpoint_dir(custom_dir=None):
+    if custom_dir and os.path.exists(custom_dir):
+        return custom_dir
+    possible_drive_dirs = [
+        "/content/drive/MyDrive/timemeshin_checkpoints",
+        "/content/drive/MyDrive",
+        "./checkpoints"
+    ]
+    for p in possible_drive_dirs:
+        if os.path.exists(p):
+            target = p if "timemeshin_checkpoints" in p else os.path.join(p, "timemeshin_checkpoints")
+            os.makedirs(target, exist_ok=True)
+            return target
+    os.makedirs("./checkpoints", exist_ok=True)
+    return "./checkpoints"
 
 CONFIG = {
     "model_name": "TimeMeshin-Indic-125M",
@@ -35,7 +46,7 @@ CONFIG = {
     "warmup_steps": 500,
     "max_steps": 50000,          # Default 50,000 steps for deep fluency
     "save_interval": 500,        # Save checkpoint every 500 steps
-    "checkpoint_dir": CHECKPOINT_DIR,
+    "checkpoint_dir": "./checkpoints", # Dynamically resolved in main
     "mixed_precision": True      # FP16 / BF16 AMP for 2.5x speedup
 }
 
@@ -130,16 +141,36 @@ def get_lr(step, warmup_steps, max_steps, max_lr, min_lr=1e-5):
     return min_lr + 0.5 * (max_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
 
 def find_latest_checkpoint(ckpt_dir):
-    checkpoints = glob.glob(os.path.join(ckpt_dir, "timemeshin_step_*.pt"))
-    if not checkpoints:
+    search_dirs = [
+        ckpt_dir,
+        "/content/drive/MyDrive/timemeshin_checkpoints",
+        "/content/drive/MyDrive",
+        "./checkpoints",
+        "../checkpoints"
+    ]
+    seen = set()
+    all_checkpoints = []
+    for d in search_dirs:
+        if d and os.path.exists(d) and d not in seen:
+            seen.add(d)
+            matches = glob.glob(os.path.join(d, "timemeshin_step_*.pt"))
+            all_checkpoints.extend(matches)
+
+    if not all_checkpoints:
         return None
-    checkpoints.sort(key=lambda x: int(x.split("_step_")[-1].replace(".pt", "")))
-    return checkpoints[-1]
+
+    all_checkpoints = list(set(all_checkpoints))
+    all_checkpoints.sort(key=lambda x: int(x.split("_step_")[-1].replace(".pt", "")))
+    return all_checkpoints[-1]
 
 def train_gpu_scaled():
     print("=========================================================================================")
     print("    TIMEMESHIN-GLASSBOX: RESILIENT GPU PRE-TRAINING ENGINE (WITH AUTO-RESUME)            ")
     print("=========================================================================================")
+
+    # Dynamically resolve Google Drive vs Local Checkpoints
+    CONFIG["checkpoint_dir"] = resolve_checkpoint_dir(CONFIG.get("checkpoint_dir"))
+    os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -295,9 +326,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TimeMeshin Scaled GPU Training Engine")
     parser.add_argument("--max_steps", type=int, default=50000, help="Total pre-training steps")
     parser.add_argument("--save_interval", type=int, default=500, help="Checkpoint interval")
+    parser.add_argument("--checkpoint_dir", type=str, default=None, help="Explicit checkpoint directory")
     args = parser.parse_args()
 
     CONFIG["max_steps"] = args.max_steps
     CONFIG["save_interval"] = args.save_interval
+    if args.checkpoint_dir:
+        CONFIG["checkpoint_dir"] = args.checkpoint_dir
 
     train_gpu_scaled()
