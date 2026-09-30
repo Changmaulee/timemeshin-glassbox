@@ -224,15 +224,24 @@ def train_gpu_scaled():
         total_params = sum(p.numel() for p in model.parameters())
         print(f"[+] Fresh Training Initialization: {total_params:,} parameters (~{total_params/1e6:.1f}M)\n")
 
-    # Connect to Streaming Multilingual Data
-    print("[*] Connecting to Streaming Multilingual Corpus...")
-    try:
-        dataset = load_dataset("wikimedia/wikipedia", "20231101.hi", split="train", streaming=True)
-        data_iter = iter(dataset)
-        print("[+] Live Hugging Face dataset stream active!")
-    except Exception as e:
-        print(f"[?] Notice: Online stream fallback to local high-density Indic buffer: {e}")
-        data_iter = None
+    # Connect to Streaming Multilingual Corpus across 8 Major Languages
+    print("[*] Connecting to Streaming Multilingual Corpus (Hindi, Tamil, Kannada, Telugu, Marathi, Bengali, Sanskrit, English)...")
+    LANG_CODES = ["hi", "ta", "kn", "te", "mr", "bn", "sa", "en"]
+    lang_iterators = {}
+    
+    for lang in LANG_CODES:
+        try:
+            ds = load_dataset("wikimedia/wikipedia", f"20231101.{lang}", split="train", streaming=True)
+            lang_iterators[lang] = iter(ds)
+            print(f"  [+] Active stream: {lang.upper()}")
+        except Exception as e:
+            print(f"  [!] Skipped stream for {lang}: {e}")
+
+    active_langs = list(lang_iterators.keys())
+    if not active_langs:
+        print("[?] Notice: Online stream fallback to local high-density Indic buffer.")
+    else:
+        print(f"[+] Total {len(active_langs)} live multilingual streams interleaved successfully!")
 
     fallback_corpus = [
         "ज्ञान और विद्या मनुष्य का सबसे बड़ा धन है । परिवर्तन ही संसार का शाश्वत नियम है ।",
@@ -240,8 +249,34 @@ def train_gpu_scaled():
         "கற்க கசடறக் கற்றவை கற்றபின் நிற்க அதற்குத் தக. யாதும் ஊரே யாவரும் கேளிர்.",
         "దేశభాషలందు తెలుగు లెస్స అని శ్రీకృష్ణదేవరాయలు కీర్తించిరి.",
         "ಸಿರಿಗನ್ನಡಂ ಗೆಲ್ಗೆ ಸಿರಿಗನ್ನಡಂ ಬಾಳ್ಗೆ ಎಂದು ಕನ್ನಡದ ಕವಿಗಳು ಹಾಡಿದ್ದಾರೆ.",
-        "মোদের গরব মোদের আশা আমরি বাংলা ভাষা । চিত্ত যেথা ভয়শূন্য उच्च যেথা শির ।"
+        "মোদের গরব মোদের আশা আমরি বাংলা ভাষা । চিত্ত যেথা ভয়শূন্য उच्च যেথা শির ।",
+        "महाराष्ट्र ही संतांची आणि शूरवीरांची पावन भूमी आहे.",
+        "Artificial intelligence and deep learning enable continuous spatio-temporal reasoning across languages."
     ]
+
+    lang_cycle_idx = 0
+
+    def get_multilingual_text():
+        nonlocal lang_cycle_idx
+        if not active_langs:
+            sample_txt = fallback_corpus[lang_cycle_idx % len(fallback_corpus)]
+            lang_cycle_idx += 1
+            return sample_txt
+
+        lang = active_langs[lang_cycle_idx % len(active_langs)]
+        lang_cycle_idx += 1
+        it = lang_iterators[lang]
+        try:
+            sample = next(it)
+            return sample.get("text", "")[:400]
+        except (StopIteration, Exception):
+            try:
+                ds = load_dataset("wikimedia/wikipedia", f"20231101.{lang}", split="train", streaming=True)
+                lang_iterators[lang] = iter(ds)
+                sample = next(lang_iterators[lang])
+                return sample.get("text", "")[:400]
+            except Exception:
+                return fallback_corpus[lang_cycle_idx % len(fallback_corpus)]
 
     model.train()
     step = start_step
@@ -249,7 +284,7 @@ def train_gpu_scaled():
     start_time = time.time()
 
     # Device autocast context
-    autocast_ctx = torch.amp.autocast('cuda', enabled=CONFIG["mixed_precision"] and device.type == "cuda") if hasattr(torch, "amp") else torch.cuda.amp.autocast(enabled=CONFIG["mixed_precision"] and device.type == "cuda")
+    autocast_ctx = torch.amp.autocast("cuda", enabled=CONFIG["mixed_precision"] and device.type == "cuda") if hasattr(torch, "amp") else torch.cuda.amp.autocast(enabled=CONFIG["mixed_precision"] and device.type == "cuda")
 
     while step < CONFIG["max_steps"]:
         step += 1
@@ -261,18 +296,7 @@ def train_gpu_scaled():
         loss_accum = 0.0
 
         for _ in range(CONFIG["grad_accum_steps"]):
-            batch_texts = []
-            for _ in range(CONFIG["batch_size"]):
-                if data_iter:
-                    try:
-                        sample = next(data_iter)
-                        batch_texts.append(sample.get("text", "")[:400])
-                    except StopIteration:
-                        data_iter = iter(dataset)
-                        sample = next(data_iter)
-                        batch_texts.append(sample.get("text", "")[:400])
-                else:
-                    batch_texts.append(fallback_corpus[(step + _) % len(fallback_corpus)])
+            batch_texts = [get_multilingual_text() for _ in range(CONFIG["batch_size"])]
 
             enc = tokenizer(
                 batch_texts,
