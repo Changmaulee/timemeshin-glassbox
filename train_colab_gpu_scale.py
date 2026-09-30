@@ -213,8 +213,11 @@ def train_gpu_scaled():
         ckpt_data = torch.load(latest_ckpt, map_location=device)
         model.load_state_dict(ckpt_data["model_state"])
         optimizer.load_state_dict(ckpt_data["optimizer_state"])
-        if "scaler_state" in ckpt_data and device.type == "cuda":
-            scaler.load_state_dict(ckpt_data["scaler_state"])
+        if "scaler_state" in ckpt_data and ckpt_data["scaler_state"] and device.type == "cuda":
+            try:
+                scaler.load_state_dict(ckpt_data["scaler_state"])
+            except Exception as e:
+                print(f"[!] Notice: Resetting AMP scaler for clean GPU resume ({e})")
         start_step = ckpt_data.get("step", 0)
         print(f"[+] Successfully resumed from Step {start_step:,} / {CONFIG['max_steps']:,}!\n")
     else:
